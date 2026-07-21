@@ -5,14 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var dbConn *pgx.Conn
 
+var jwtSecret = []byte("super-secret-key-change-this-later")
+
 type SignupRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
@@ -57,6 +66,49 @@ func signupHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "user created successfully")
 }
 
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req LoginRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	var userID int
+	var storedHash string
+	err = dbConn.QueryRow(context.Background(),
+		"SELECT id, password_hash FROM users WHERE email=$1", req.Email).Scan(&userID, &storedHash)
+	if err != nil {
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password))
+	if err != nil {
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	claims := jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(24 * time.Hour).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString(jwtSecret)
+	if err != nil {
+		http.Error(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+}
+
 func connectDB() {
 	connString := "postgres://minidrive:minidrive123@localhost:5433/minidrive_db"
 
@@ -74,6 +126,7 @@ func main() {
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/signup", signupHandler)
+	http.HandleFunc("/login", loginHandler)
 
 	fmt.Println("Server starting on port 8080...")
 	http.ListenAndServe(":8080", nil)
