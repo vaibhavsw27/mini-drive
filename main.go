@@ -13,11 +13,14 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
+var redisClient *redis.Client
 var minioClient *minio.Client
 var dbConn *pgx.Conn
 
@@ -257,33 +260,42 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	versionParam := r.URL.Query().Get("version")
-
-	var storageKey string
 	ctx := context.Background()
 
-	if versionParam == "" {
-		err := dbConn.QueryRow(ctx, `
-			SELECT f.storage_key FROM files f
-			WHERE f.filename=$2 AND (
-				f.owner_id=$1
-				OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
-			)
-			ORDER BY f.version DESC LIMIT 1`, userID, filename).Scan(&storageKey)
+	cacheKey := fmt.Sprintf("filekey:%v:%s:%s", userID, filename, versionParam)
+
+	var storageKey string
+
+	cached, err := redisClient.Get(ctx, cacheKey).Result()
+	if err == nil {
+		storageKey = cached
+		fmt.Println("Cache hit for", cacheKey)
+	} else {
+		fmt.Println("Cache miss for", cacheKey)
+
+		if versionParam == "" {
+			err = dbConn.QueryRow(ctx, `
+				SELECT f.storage_key FROM files f
+				WHERE f.filename=$2 AND (
+					f.owner_id=$1
+					OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
+				)
+				ORDER BY f.version DESC LIMIT 1`, userID, filename).Scan(&storageKey)
+		} else {
+			err = dbConn.QueryRow(ctx, `
+				SELECT f.storage_key FROM files f
+				WHERE f.filename=$2 AND f.version=$3 AND (
+					f.owner_id=$1
+					OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
+				)`, userID, filename, versionParam).Scan(&storageKey)
+		}
+
 		if err != nil {
 			http.Error(w, "file not found or access denied", http.StatusNotFound)
 			return
 		}
-	} else {
-		err := dbConn.QueryRow(ctx, `
-			SELECT f.storage_key FROM files f
-			WHERE f.filename=$2 AND f.version=$3 AND (
-				f.owner_id=$1
-				OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
-			)`, userID, filename, versionParam).Scan(&storageKey)
-		if err != nil {
-			http.Error(w, "file version not found or access denied", http.StatusNotFound)
-			return
-		}
+
+		redisClient.Set(ctx, cacheKey, storageKey, 5*time.Minute)
 	}
 
 	object, err := minioClient.GetObject(ctx, "mini-drive-files", storageKey, minio.GetObjectOptions{})
@@ -299,6 +311,20 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to send file", http.StatusInternalServerError)
 		return
 	}
+}
+
+func connectRedis() {
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	ctx := context.Background()
+	_, err := redisClient.Ping(ctx).Result()
+	if err != nil {
+		fmt.Println("Unable to connect to Redis:", err)
+		return
+	}
+	fmt.Println("Connected to Redis successfully!")
 }
 
 func connectMinio() {
@@ -344,6 +370,7 @@ func connectDB() {
 func main() {
 	connectDB()
 	connectMinio()
+	connectRedis()
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/signup", signupHandler)
