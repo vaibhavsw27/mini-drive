@@ -26,6 +26,14 @@ services:
     volumes:
       - miniodata:/data
 
+  redis:
+      image: redis:7
+      container_name: mini-drive-cache
+      restart: always
+      ports:
+        - "6379:6379"
+
 volumes:
   pgdata:
   miniodata:
+
