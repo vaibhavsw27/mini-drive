@@ -200,10 +200,11 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(userIDKey)
 	fmt.Fprintf(w, "You are logged in as user_id: %v\n", userID)
 }
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(userIDKey)
 
-	err := r.ParseMultipartForm(32 << 20) // 32MB max
+	err := r.ParseMultipartForm(32 << 20)
 	if err != nil {
 		http.Error(w, "failed to parse form", http.StatusBadRequest)
 		return
@@ -216,9 +217,20 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	storageKey := fmt.Sprintf("%v_%s", userID, header.Filename)
-
 	ctx := context.Background()
+
+	var latestVersion int
+	err = dbConn.QueryRow(ctx,
+		"SELECT COALESCE(MAX(version), 0) FROM files WHERE owner_id=$1 AND filename=$2",
+		userID, header.Filename).Scan(&latestVersion)
+	if err != nil {
+		http.Error(w, "failed to check existing versions", http.StatusInternalServerError)
+		return
+	}
+
+	newVersion := latestVersion + 1
+	storageKey := fmt.Sprintf("%v_%s_v%d", userID, header.Filename, newVersion)
+
 	_, err = minioClient.PutObject(ctx, "mini-drive-files", storageKey, file, header.Size, minio.PutObjectOptions{})
 	if err != nil {
 		http.Error(w, "failed to upload to storage: "+err.Error(), http.StatusInternalServerError)
@@ -226,14 +238,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err = dbConn.Exec(ctx,
-		"INSERT INTO files (owner_id, filename, storage_key, size) VALUES ($1, $2, $3, $4)",
-		userID, header.Filename, storageKey, header.Size)
+		"INSERT INTO files (owner_id, filename, storage_key, size, version) VALUES ($1, $2, $3, $4, $5)",
+		userID, header.Filename, storageKey, header.Size, newVersion)
 	if err != nil {
 		http.Error(w, "failed to save file metadata: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Fprintf(w, "File uploaded successfully: %s\n", header.Filename)
+	fmt.Fprintf(w, "File uploaded successfully: %s (version %d)\n", header.Filename, newVersion)
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -244,17 +256,34 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	versionParam := r.URL.Query().Get("version")
+
 	var storageKey string
 	ctx := context.Background()
-	err := dbConn.QueryRow(ctx, `
-		SELECT f.storage_key FROM files f
-		WHERE f.filename=$2 AND (
-			f.owner_id=$1
-			OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
-		)`, userID, filename).Scan(&storageKey)
-	if err != nil {
-		http.Error(w, "file not found or access denied", http.StatusNotFound)
-		return
+
+	if versionParam == "" {
+		err := dbConn.QueryRow(ctx, `
+			SELECT f.storage_key FROM files f
+			WHERE f.filename=$2 AND (
+				f.owner_id=$1
+				OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
+			)
+			ORDER BY f.version DESC LIMIT 1`, userID, filename).Scan(&storageKey)
+		if err != nil {
+			http.Error(w, "file not found or access denied", http.StatusNotFound)
+			return
+		}
+	} else {
+		err := dbConn.QueryRow(ctx, `
+			SELECT f.storage_key FROM files f
+			WHERE f.filename=$2 AND f.version=$3 AND (
+				f.owner_id=$1
+				OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
+			)`, userID, filename, versionParam).Scan(&storageKey)
+		if err != nil {
+			http.Error(w, "file version not found or access denied", http.StatusNotFound)
+			return
+		}
 	}
 
 	object, err := minioClient.GetObject(ctx, "mini-drive-files", storageKey, minio.GetObjectOptions{})

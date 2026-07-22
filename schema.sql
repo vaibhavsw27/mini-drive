@@ -21,3 +21,6 @@ CREATE TABLE file_shares (
     created_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(file_id, shared_with_user_id)
 );
+
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1;

@@ -3,3 +3,8 @@
 /bin
 /tmp
 .vscode/
+test.txt
+downloaded_test.txt
+shared_download.txt
+*.json
+!package.json
