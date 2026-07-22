@@ -4,15 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
+var minioClient *minio.Client
 var dbConn *pgx.Conn
 
 var jwtSecret = []byte("super-secret-key-change-this-later")
@@ -150,6 +156,101 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value(userIDKey)
 	fmt.Fprintf(w, "You are logged in as user_id: %v\n", userID)
 }
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(userIDKey)
+
+	err := r.ParseMultipartForm(32 << 20) // 32MB max
+	if err != nil {
+		http.Error(w, "failed to parse form", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "failed to get file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	storageKey := fmt.Sprintf("%v_%s", userID, header.Filename)
+
+	ctx := context.Background()
+	_, err = minioClient.PutObject(ctx, "mini-drive-files", storageKey, file, header.Size, minio.PutObjectOptions{})
+	if err != nil {
+		http.Error(w, "failed to upload to storage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	_, err = dbConn.Exec(ctx,
+		"INSERT INTO files (owner_id, filename, storage_key, size) VALUES ($1, $2, $3, $4)",
+		userID, header.Filename, storageKey, header.Size)
+	if err != nil {
+		http.Error(w, "failed to save file metadata: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "File uploaded successfully: %s\n", header.Filename)
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(userIDKey)
+	filename := r.URL.Query().Get("filename")
+	if filename == "" {
+		http.Error(w, "filename query param required", http.StatusBadRequest)
+		return
+	}
+
+	var storageKey string
+	ctx := context.Background()
+	err := dbConn.QueryRow(ctx,
+		"SELECT storage_key FROM files WHERE owner_id=$1 AND filename=$2", userID, filename).Scan(&storageKey)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+
+	object, err := minioClient.GetObject(ctx, "mini-drive-files", storageKey, minio.GetObjectOptions{})
+	if err != nil {
+		http.Error(w, "failed to get file from storage", http.StatusInternalServerError)
+		return
+	}
+	defer object.Close()
+
+	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(filename))
+	_, err = io.Copy(w, object)
+	if err != nil {
+		http.Error(w, "failed to send file", http.StatusInternalServerError)
+		return
+	}
+}
+
+func connectMinio() {
+	client, err := minio.New("localhost:9000", &minio.Options{
+		Creds:  credentials.NewStaticV4("minidrive", "minidrive123", ""),
+		Secure: false,
+	})
+	if err != nil {
+		fmt.Println("Unable to connect to MinIO:", err)
+		return
+	}
+	minioClient = client
+
+	ctx := context.Background()
+	bucketName := "mini-drive-files"
+	exists, err := minioClient.BucketExists(ctx, bucketName)
+	if err != nil {
+		fmt.Println("Error checking bucket:", err)
+		return
+	}
+	if !exists {
+		err = minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
+		if err != nil {
+			fmt.Println("Error creating bucket:", err)
+			return
+		}
+	}
+	fmt.Println("Connected to MinIO successfully!")
+}
 
 func connectDB() {
 	connString := "postgres://minidrive:minidrive123@localhost:5433/minidrive_db"
@@ -165,11 +266,14 @@ func connectDB() {
 
 func main() {
 	connectDB()
+	connectMinio()
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/signup", signupHandler)
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/me", authMiddleware(meHandler))
+	http.HandleFunc("/upload", authMiddleware(uploadHandler))
+	http.HandleFunc("/download", authMiddleware(downloadHandler))
 
 	fmt.Println("Server starting on port 8080...")
 	http.ListenAndServe(":8080", nil)
