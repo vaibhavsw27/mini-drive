@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +49,52 @@ const userIDKey contextKey = "user_id"
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
+}
+
+func startChecksumWorker() {
+	go func() {
+		ctx := context.Background()
+		for {
+			result, err := redisClient.BRPop(ctx, 0, "checksum_jobs").Result()
+			if err != nil {
+				fmt.Println("Worker error:", err)
+				continue
+			}
+
+			jobData := result[1]
+			parts := strings.SplitN(jobData, "|", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			storageKey := parts[0]
+			filename := parts[1]
+
+			object, err := minioClient.GetObject(ctx, "mini-drive-files", storageKey, minio.GetObjectOptions{})
+			if err != nil {
+				fmt.Println("Worker: failed to fetch file:", err)
+				continue
+			}
+
+			hasher := sha256.New()
+			_, err = io.Copy(hasher, object)
+			object.Close()
+			if err != nil {
+				fmt.Println("Worker: failed to hash file:", err)
+				continue
+			}
+
+			checksum := hex.EncodeToString(hasher.Sum(nil))
+
+			_, err = dbConn.Exec(ctx,
+				"UPDATE files SET checksum=$1 WHERE storage_key=$2", checksum, storageKey)
+			if err != nil {
+				fmt.Println("Worker: failed to save checksum:", err)
+				continue
+			}
+
+			fmt.Printf("Worker: computed checksum for %s: %s\n", filename, checksum)
+		}
+	}()
 }
 
 func signupHandler(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +296,12 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jobData := fmt.Sprintf("%s|%s", storageKey, header.Filename)
+	err = redisClient.LPush(ctx, "checksum_jobs", jobData).Err()
+	if err != nil {
+		fmt.Println("Failed to queue checksum job:", err)
+	}
+
 	fmt.Fprintf(w, "File uploaded successfully: %s (version %d)\n", header.Filename, newVersion)
 }
 
@@ -371,6 +425,7 @@ func main() {
 	connectDB()
 	connectMinio()
 	connectRedis()
+	startChecksumWorker()
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/signup", signupHandler)
