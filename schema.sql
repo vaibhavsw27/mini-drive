@@ -13,3 +13,11 @@ CREATE TABLE files (
     size BIGINT,
     uploaded_at TIMESTAMP DEFAULT NOW()
 );
+
+CREATE TABLE file_shares (
+    id SERIAL PRIMARY KEY,
+    file_id INTEGER REFERENCES files(id),
+    shared_with_user_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(file_id, shared_with_user_id)
+);

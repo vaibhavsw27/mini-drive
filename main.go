@@ -33,6 +33,11 @@ type LoginRequest struct {
 	Password string `json:"password"`
 }
 
+type ShareRequest struct {
+	Filename       string `json:"filename"`
+	ShareWithEmail string `json:"share_with_email"`
+}
+
 type contextKey string
 
 const userIDKey contextKey = "user_id"
@@ -120,6 +125,45 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
 }
 
+func shareHandler(w http.ResponseWriter, r *http.Request) {
+	ownerID := r.Context().Value(userIDKey)
+
+	var req ShareRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+
+	var fileID int
+	err = dbConn.QueryRow(ctx,
+		"SELECT id FROM files WHERE owner_id=$1 AND filename=$2", ownerID, req.Filename).Scan(&fileID)
+	if err != nil {
+		http.Error(w, "file not found or you don't own it", http.StatusNotFound)
+		return
+	}
+
+	var shareWithUserID int
+	err = dbConn.QueryRow(ctx,
+		"SELECT id FROM users WHERE email=$1", req.ShareWithEmail).Scan(&shareWithUserID)
+	if err != nil {
+		http.Error(w, "user to share with not found", http.StatusNotFound)
+		return
+	}
+
+	_, err = dbConn.Exec(ctx,
+		"INSERT INTO file_shares (file_id, shared_with_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+		fileID, shareWithUserID)
+	if err != nil {
+		http.Error(w, "failed to share file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "File '%s' shared with %s\n", req.Filename, req.ShareWithEmail)
+}
+
 // authMiddleware checks for a valid JWT token before allowing the request through
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -202,10 +246,14 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	var storageKey string
 	ctx := context.Background()
-	err := dbConn.QueryRow(ctx,
-		"SELECT storage_key FROM files WHERE owner_id=$1 AND filename=$2", userID, filename).Scan(&storageKey)
+	err := dbConn.QueryRow(ctx, `
+		SELECT f.storage_key FROM files f
+		WHERE f.filename=$2 AND (
+			f.owner_id=$1
+			OR f.id IN (SELECT file_id FROM file_shares WHERE shared_with_user_id=$1)
+		)`, userID, filename).Scan(&storageKey)
 	if err != nil {
-		http.Error(w, "file not found", http.StatusNotFound)
+		http.Error(w, "file not found or access denied", http.StatusNotFound)
 		return
 	}
 
@@ -274,6 +322,7 @@ func main() {
 	http.HandleFunc("/me", authMiddleware(meHandler))
 	http.HandleFunc("/upload", authMiddleware(uploadHandler))
 	http.HandleFunc("/download", authMiddleware(downloadHandler))
+	http.HandleFunc("/share", authMiddleware(shareHandler))
 
 	fmt.Println("Server starting on port 8080...")
 	http.ListenAndServe(":8080", nil)
