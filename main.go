@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -417,12 +418,25 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func connectRedis() {
-	redisClient = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	redisURL := os.Getenv("redis://default:ghmrsVHcnpWEieANBGqCPwRZyuUXIjEu@redis.railway.internal:6379")
+
+	var opts *redis.Options
+	var err error
+
+	if redisURL != "" {
+		opts, err = redis.ParseURL(redisURL)
+		if err != nil {
+			fmt.Println("Invalid Redis URL:", err)
+			return
+		}
+	} else {
+		opts = &redis.Options{Addr: "localhost:6379"}
+	}
+
+	redisClient = redis.NewClient(opts)
 
 	ctx := context.Background()
-	_, err := redisClient.Ping(ctx).Result()
+	_, err = redisClient.Ping(ctx).Result()
 	if err != nil {
 		fmt.Println("Unable to connect to Redis:", err)
 		return
@@ -459,7 +473,10 @@ func connectMinio() {
 }
 
 func connectDB() {
-	connString := "postgres://minidrive:minidrive123@localhost:5433/minidrive_db"
+	connString := os.Getenv("postgresql://postgres:OaWGRtNLJAJdMKSxbsnSXZjSzHfTqyxD@postgres.railway.internal:5432/railway")
+	if connString == "" {
+		connString = "postgres://minidrive:minidrive123@localhost:5433/minidrive_db"
+	}
 
 	conn, err := pgx.Connect(context.Background(), connString)
 	if err != nil {
