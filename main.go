@@ -17,6 +17,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
@@ -25,6 +28,29 @@ import (
 var redisClient *redis.Client
 var minioClient *minio.Client
 var dbConn *pgx.Conn
+
+var (
+	requestCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"path", "method", "status"},
+	)
+
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "http_request_duration_seconds",
+			Help: "Duration of HTTP requests in seconds",
+		},
+		[]string{"path"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(requestCount)
+	prometheus.MustRegister(requestDuration)
+}
 
 var jwtSecret = []byte("super-secret-key-change-this-later")
 
@@ -213,6 +239,29 @@ func shareHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w, "File '%s' shared with %s\n", req.Filename, req.ShareWithEmail)
+}
+
+func metricsMiddleware(path string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		rec := &statusRecorder{ResponseWriter: w, status: 200}
+		next(rec, r)
+
+		duration := time.Since(start).Seconds()
+		requestDuration.WithLabelValues(path).Observe(duration)
+		requestCount.WithLabelValues(path, r.Method, fmt.Sprintf("%d", rec.status)).Inc()
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
 }
 
 // authMiddleware checks for a valid JWT token before allowing the request through
@@ -427,13 +476,14 @@ func main() {
 	connectRedis()
 	startChecksumWorker()
 
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/signup", signupHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/me", authMiddleware(meHandler))
-	http.HandleFunc("/upload", authMiddleware(uploadHandler))
-	http.HandleFunc("/download", authMiddleware(downloadHandler))
-	http.HandleFunc("/share", authMiddleware(shareHandler))
+	http.HandleFunc("/health", metricsMiddleware("/health", healthHandler))
+	http.HandleFunc("/signup", metricsMiddleware("/signup", signupHandler))
+	http.HandleFunc("/login", metricsMiddleware("/login", loginHandler))
+	http.HandleFunc("/me", metricsMiddleware("/me", authMiddleware(meHandler)))
+	http.HandleFunc("/upload", metricsMiddleware("/upload", authMiddleware(uploadHandler)))
+	http.HandleFunc("/download", metricsMiddleware("/download", authMiddleware(downloadHandler)))
+	http.HandleFunc("/share", metricsMiddleware("/share", authMiddleware(shareHandler)))
+	http.Handle("/metrics", promhttp.Handler())
 
 	fmt.Println("Server starting on port 8080...")
 	http.ListenAndServe(":8080", nil)
